@@ -4,7 +4,7 @@
 **Project path:** `E:\Dindex\Rush\Backend` (Laravel 11, 3-tier Presentation / Business / Data, Sanctum).  
 **Swagger:** `http://127.0.0.1:8010/docs` · API base: `/api/v1`  
 **Tests:** `php artisan test` ? **57 passed** (last run).  
-**OpenAPI version:** `0.8.1` · Docs: `docs/openapi.yaml` + `info/API.md`
+**OpenAPI version:** `0.9.0` · Docs: `docs/openapi.yaml` + `info/API.md` · Swagger UI: `/docs`
 
 ---
 

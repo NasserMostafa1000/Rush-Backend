@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: Rush API
-  version: 0.8.1
+  version: 0.9.0
   description: |
     Rush location-based backend (Laravel 11 — Presentation / Business / Data).
 
@@ -20,7 +20,16 @@ info:
     `pending_payment` → (Stripe webhook) → **`awaiting_driver`** (waiting for driver acceptance) →
     `driver_assigned` (driver accepted) → `picked_up` → `delivered`. Cash orders start at `awaiting_driver`.
     Legacy statuses kept: `confirmed`, `awaiting_cash`.
-    New `awaiting_driver` orders notify **nearby approved+online drivers only** (H3 k-ring around pickup).
+    New `awaiting_driver` orders notify **nearby approved+online drivers whose vehicle matches**
+    the order transportation (`car`|`motorcycle`) via H3 k-ring around **every** pickup
+    (`H3_RESOLUTION` default 8, `H3_RING_K` default 2). Far / wrong-vehicle drivers are skipped.
+    One accept claims the whole order (all `details`, including multi-store `request delivery`).
+
+    ## Driver offers
+    - `GET /driver/orders/available` — H3 nearby + matching vehicle + not declined
+    - `GET /driver/orders/{id}` — full order + all details
+    - `POST .../accept` — race-safe (409 `order_unavailable` if already taken)
+    - `POST .../reject` — decline for this driver only
 
     ## Cancel + Refund
     `POST /orders/{id}/cancel` requires **`cancellation_reason`**.
@@ -235,12 +244,25 @@ paths:
   /driver/orders/available:
     get:
       tags: [Driver]
-      summary: List awaiting_driver offers matching vehicle type
+      summary: Nearby awaiting_driver offers (H3 + matching vehicle; excludes declined)
       operationId: listDriverAvailableOrders
       security: [{ sanctum: [] }]
       responses:
         '200':
           description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  orders:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Order'
+                  is_online:
+                    type: boolean
+        '422':
+          description: driver_offline / driver_not_verified
 
   /driver/orders:
     get:
@@ -255,11 +277,20 @@ paths:
       responses:
         '200':
           description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  orders:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Order'
 
   /driver/orders/{order}:
     get:
       tags: [Driver]
-      summary: Show offer or assigned order
+      summary: Full offer or assigned order (all details / multi-store)
       operationId: getDriverOrder
       security: [{ sanctum: [] }]
       parameters:
@@ -270,6 +301,15 @@ paths:
       responses:
         '200':
           description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  order:
+                    $ref: '#/components/schemas/Order'
+        '422':
+          description: transportation_mismatch
 
   /driver/orders/{order}/accept:
     post:
@@ -285,10 +325,17 @@ paths:
       responses:
         '200':
           description: driver_assigned
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  order:
+                    $ref: '#/components/schemas/Order'
         '409':
           description: order_unavailable
         '422':
-          description: transportation_mismatch / driver_offline
+          description: transportation_mismatch / driver_offline / vehicle_required
 
   /driver/orders/{order}/reject:
     post:
@@ -304,6 +351,14 @@ paths:
       responses:
         '200':
           description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok, order_id]
+                properties:
+                  ok: { type: boolean, example: true }
+                  order_id: { type: string, example: RSH-A3K9MX }
         '409':
           description: order_unavailable
 
@@ -353,6 +408,18 @@ paths:
       responses:
         '200':
           description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  earnings:
+                    type: object
+                    properties:
+                      delivered_orders: { type: integer }
+                      active_orders: { type: integer }
+                      total_tips: { type: string, example: "5.00" }
+                      currency: { type: string, example: aed }
 
   /admin/drivers/{user}/verify:
     post:
@@ -1530,6 +1597,18 @@ components:
           enum: [incomplete, under_review, approved, rejected]
         can_go_online:
           type: boolean
+        is_online:
+          type: boolean
+        last_latitude:
+          type: string
+          nullable: true
+        last_longitude:
+          type: string
+          nullable: true
+        last_online_at:
+          type: string
+          format: date-time
+          nullable: true
         verification_note:
           type: string
           nullable: true
@@ -1930,6 +2009,20 @@ components:
         rating_comment:
           type: string
           nullable: true
+        delivery_proof_path:
+          type: string
+          nullable: true
+        delivery_proof_url:
+          type: string
+          nullable: true
+        picked_up_at:
+          type: string
+          format: date-time
+          nullable: true
+        delivered_at:
+          type: string
+          format: date-time
+          nullable: true
         can_cancel:
           type: boolean
           description: True only before a driver accepts (pending_payment/awaiting_cash/confirmed/awaiting_driver)
@@ -1948,6 +2041,7 @@ components:
         driver_id:
           type: string
           nullable: true
+          description: Driver public_id after accept
         ordered_at:
           type: string
           format: date-time
@@ -2110,6 +2204,38 @@ components:
         payment:
           $ref: '#/components/schemas/Payment'
 
+    NewOrderOfferData:
+      type: object
+      description: `notification.data` when type=new_order_offer
+      properties:
+        type:
+          type: string
+          enum: [new_order_offer]
+        order_id:
+          type: string
+        status:
+          type: string
+          enum: [awaiting_driver]
+        service:
+          type: string
+          nullable: true
+          description: Service name (send a package, request delivery, …)
+        details_count:
+          type: integer
+          description: Number of order_details (multi-store ≥ 2)
+        transportation_ids:
+          type: array
+          items: { type: integer }
+        transportation:
+          type: string
+          nullable: true
+          enum: [car, motorcycle]
+        distance_meters:
+          type: integer
+        h3_index:
+          type: string
+          nullable: true
+
     Notification:
       type: object
       properties:
@@ -2131,10 +2257,12 @@ components:
         route:
           type: string
           nullable: true
-          example: /orders/RSH-A3K9MX
+          example: /driver/orders/RSH-A3K9MX
         data:
-          type: object
           nullable: true
+          oneOf:
+            - $ref: '#/components/schemas/NewOrderOfferData'
+            - type: object
         is_read:
           type: boolean
         read_at:

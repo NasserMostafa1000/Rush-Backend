@@ -66,7 +66,10 @@ Flutter flow for card payments:
 | POST | `/orders/{id}/rate` | Bearer | `{ rating: 1-5, comment? }` |
 
 Order statuses: `pending_payment → awaiting_driver → driver_assigned → picked_up → delivered` (+ `cancelled`).
-| POST | `/webhooks/stripe` | Stripe sig | marks payment paid → order confirmed |
+
+| Method | Path | Auth | Notes |
+|--------|------|------|-------|
+| POST | `/webhooks/stripe` | Stripe sig | marks payment paid → order **`awaiting_driver`** + nearby H3/vehicle notify |
 
 Order body extras: `payment_method` (`card`|`cash`), `payer` (`sender`|`receiver`), `pickup_timing` (`asap`|`scheduled`), `scheduled_pickup_at`, `tip_amount`, `promo_code`, `loyalty_points_to_redeem`, `distance_km`, addresses, `package_size`, personal shopping: `shopping_request`, `is_already_paid`, `expected_order_value`, `invoice_image`.
 
@@ -114,6 +117,12 @@ R2_DEFAULT_REGION=auto
 R2_USE_PATH_STYLE_ENDPOINT=true
 R2_ROOT=rush
 R2_FAKE=false
+
+H3_RESOLUTION=8
+H3_RING_K=2
 ```
 
 Local/tests: `STRIPE_FAKE=true` and `R2_FAKE=true` skip real providers.
+
+Swagger OpenAPI: `docs/openapi.yaml` (served at `/docs`) — current version **0.9.0**.  
+Handoff context: `SESSION_CONTEXT.md`.
