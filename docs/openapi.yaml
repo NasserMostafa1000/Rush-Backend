@@ -1,0 +1,2218 @@
+openapi: 3.1.0
+info:
+  title: Rush API
+  version: 0.8.1
+  description: |
+    Rush location-based backend (Laravel 11 — Presentation / Business / Data).
+
+    ## Auth
+    One `register` / `login`. Provider: `google` | `apple` | `phone`.
+    Always returns `{ token, user }` (Sanctum). Works for **personal | store | driver**.
+    OTP is handled in Flutter (backend does not require OTP by default).
+    **Store** registration requires `license_image` (multipart → Cloudflare R2).
+    **Driver** registration creates a `driver` profile shell (`verification_status=incomplete`);
+    complete via `/driver/*` then `POST /driver/submit`. Vehicle type = transportation name/code (`car`|`motorcycle`); backend maps to `service_transportations.id`.
+    **Edit Profile** (Figma): `PATCH /auth/profile` (JSON) or `POST /auth/profile` (multipart for `profile_image`).
+    Drivers should send `latitude`/`longitude` on login (and `PATCH /auth/location` while moving).
+    Location is stored on `users` with an H3 hex index used for nearby-order fanout.
+
+    ## Order statuses (order_statuses table)
+    `pending_payment` → (Stripe webhook) → **`awaiting_driver`** (waiting for driver acceptance) →
+    `driver_assigned` (driver accepted) → `picked_up` → `delivered`. Cash orders start at `awaiting_driver`.
+    Legacy statuses kept: `confirmed`, `awaiting_cash`.
+    New `awaiting_driver` orders notify **nearby approved+online drivers only** (H3 k-ring around pickup).
+
+    ## Cancel + Refund
+    `POST /orders/{id}/cancel` requires **`cancellation_reason`**.
+    Customer can cancel only in `pending_payment | awaiting_cash | confirmed | awaiting_driver`
+    (before a driver accepts — see `order.can_cancel`). Once `driver_assigned | picked_up | delivered`, cancel returns 422 `cannot_cancel`.
+    Paid card orders are **auto-refunded via Stripe to the original payment method** (`refund_status=refunded`, `payment.refund_id`).
+    Unpaid card intents are voided (`refund_status=not_required`). Loyalty points are restored and promo redemption is released.
+
+    ## Payments (Stripe)
+    1. `POST /orders` with `payment_method=card` → `pending_payment` + `payment.client_secret`
+    2. Confirm PaymentIntent in Flutter (Stripe SDK)
+    3. Stripe → `POST /webhooks/stripe`
+    4. Poll `GET /orders/{id}/payment-status` until `success=true` (then order is `awaiting_driver`)
+
+    ## Admin
+    Promo codes, loyalty settings, and driver verification require Bearer token of a user with role `admin`.
+servers:
+  - url: /api/v1
+    description: Same origin as Swagger
+  - url: http://127.0.0.1:8010/api/v1
+    description: Local artisan serve
+tags:
+  - name: Auth
+  - name: Profile
+    description: Edit profile + saved addresses (Figma My profile / Edit profile)
+  - name: Driver
+    description: Driver onboarding (identity, documents, vehicle via transportation name/code, submit for review)
+  - name: Orders
+  - name: Payments
+  - name: Notifications
+  - name: Loyalty
+  - name: Admin
+paths:
+  /transportations:
+    get:
+      tags: [Driver]
+      summary: List vehicle types (service_transportations)
+      operationId: listTransportations
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  transportations:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        id: { type: integer, example: 2 }
+                        code: { type: string, example: motorcycle }
+                        label: { type: string, example: Motorcycle }
+
+  /driver/profile:
+    get:
+      tags: [Driver]
+      summary: Get driver onboarding profile
+      operationId: getDriverProfile
+      security: [{ sanctum: [] }]
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  driver:
+                    $ref: '#/components/schemas/DriverProfile'
+        '403':
+          description: Not a driver
+    patch:
+      tags: [Driver]
+      summary: Update driver identity / emergency / payout fields
+      operationId: updateDriverProfile
+      security: [{ sanctum: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                name: { type: string }
+                national_id_number: { type: string }
+                service_area: { type: string }
+                emergency_contact_name: { type: string }
+                emergency_contact_phone: { type: string }
+                bank_name: { type: string }
+                iban: { type: string }
+                ziina_payment_link: { type: string }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  driver:
+                    $ref: '#/components/schemas/DriverProfile'
+
+  /driver/documents:
+    post:
+      tags: [Driver]
+      summary: Upload driver identity documents (R2)
+      operationId: uploadDriverDocuments
+      security: [{ sanctum: [] }]
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              properties:
+                national_id_front: { type: string, format: binary }
+                national_id_back: { type: string, format: binary }
+                personal_photo: { type: string, format: binary }
+                driving_license_front: { type: string, format: binary }
+      responses:
+        '200':
+          description: OK
+
+  /driver/vehicle:
+    put:
+      tags: [Driver]
+      summary: Create/update current vehicle (send transportation name; backend maps to service_transportations.id)
+      operationId: upsertDriverVehicle
+      security: [{ sanctum: [] }]
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [transportation, model, plate_number]
+              properties:
+                transportation:
+                  type: string
+                  description: Name/code from service_transportations (backend resolves to id)
+                  enum: [car, motorcycle]
+                  example: motorcycle
+                model: { type: string, example: Bajaj Boxer 150 }
+                color: { type: string, example: Black }
+                plate_number: { type: string, example: D-48242 }
+                vehicle_image: { type: string, format: binary }
+                document: { type: string, format: binary }
+      responses:
+        '200':
+          description: OK
+    post:
+      tags: [Driver]
+      summary: Same as PUT /driver/vehicle
+      operationId: upsertDriverVehiclePost
+      security: [{ sanctum: [] }]
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [transportation, model, plate_number]
+              properties:
+                transportation:
+                  type: string
+                  enum: [car, motorcycle]
+                  example: motorcycle
+                model: { type: string }
+                color: { type: string }
+                plate_number: { type: string }
+                vehicle_image: { type: string, format: binary }
+                document: { type: string, format: binary }
+      responses:
+        '200':
+          description: OK
+
+  /driver/submit:
+    post:
+      tags: [Driver]
+      summary: Submit driver profile for verification review
+      operationId: submitDriverProfile
+      security: [{ sanctum: [] }]
+      responses:
+        '200':
+          description: Status becomes under_review
+        '422':
+          description: driver_profile_incomplete
+
+  /driver/online:
+    patch:
+      tags: [Driver]
+      summary: Go online/offline (approved drivers only)
+      operationId: setDriverOnline
+      security: [{ sanctum: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [is_online]
+              properties:
+                is_online: { type: boolean }
+                latitude: { type: number }
+                longitude: { type: number }
+      responses:
+        '200':
+          description: OK
+
+  /driver/orders/available:
+    get:
+      tags: [Driver]
+      summary: List awaiting_driver offers matching vehicle type
+      operationId: listDriverAvailableOrders
+      security: [{ sanctum: [] }]
+      responses:
+        '200':
+          description: OK
+
+  /driver/orders:
+    get:
+      tags: [Driver]
+      summary: List my assigned orders
+      operationId: listDriverOrders
+      security: [{ sanctum: [] }]
+      parameters:
+        - name: scope
+          in: query
+          schema: { type: string, enum: [active, history, all] }
+      responses:
+        '200':
+          description: OK
+
+  /driver/orders/{order}:
+    get:
+      tags: [Driver]
+      summary: Show offer or assigned order
+      operationId: getDriverOrder
+      security: [{ sanctum: [] }]
+      parameters:
+        - name: order
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: OK
+
+  /driver/orders/{order}/accept:
+    post:
+      tags: [Driver]
+      summary: Accept order (race-safe lock + atomic claim; whole order incl. multi-details)
+      operationId: acceptDriverOrder
+      security: [{ sanctum: [] }]
+      parameters:
+        - name: order
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: driver_assigned
+        '409':
+          description: order_unavailable
+        '422':
+          description: transportation_mismatch / driver_offline
+
+  /driver/orders/{order}/reject:
+    post:
+      tags: [Driver]
+      summary: Decline offer for this driver only (order stays awaiting_driver)
+      operationId: rejectDriverOrder
+      security: [{ sanctum: [] }]
+      parameters:
+        - name: order
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: OK
+        '409':
+          description: order_unavailable
+
+  /driver/orders/{order}/picked-up:
+    post:
+      tags: [Driver]
+      summary: Mark picked up
+      operationId: pickupDriverOrder
+      security: [{ sanctum: [] }]
+      parameters:
+        - name: order
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: picked_up
+
+  /driver/orders/{order}/delivered:
+    post:
+      tags: [Driver]
+      summary: Mark delivered (optional proof_image)
+      operationId: deliverDriverOrder
+      security: [{ sanctum: [] }]
+      parameters:
+        - name: order
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              properties:
+                proof_image: { type: string, format: binary }
+      responses:
+        '200':
+          description: delivered
+
+  /driver/earnings:
+    get:
+      tags: [Driver]
+      summary: Driver earnings summary
+      operationId: driverEarnings
+      security: [{ sanctum: [] }]
+      responses:
+        '200':
+          description: OK
+
+  /admin/drivers/{user}/verify:
+    post:
+      tags: [Admin]
+      summary: Approve/reject driver verification
+      operationId: verifyDriver
+      security: [{ sanctum: [] }]
+      parameters:
+        - name: user
+          in: path
+          required: true
+          schema: { type: string }
+          description: Driver public_id
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [status]
+              properties:
+                status:
+                  type: string
+                  enum: [approved, rejected, under_review]
+                note: { type: string }
+      responses:
+        '200':
+          description: OK
+
+  /auth/register:
+    post:
+      tags: [Auth]
+      summary: Register — returns Sanctum token + full profile
+      description: |
+        - **google/apple:** `token` required.
+        - **phone:** `phone` required.
+        - **store:** send as **multipart/form-data** and attach **`license_image`** (required).
+        - Optional `invite_code` links to inviter for loyalty rewards.
+      operationId: authRegister
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [login_provider_name]
+              properties:
+                login_provider_name:
+                  type: string
+                  enum: [google, apple, phone]
+                token:
+                  type: string
+                  nullable: true
+                  description: Required for google/apple
+                phone:
+                  type: string
+                  nullable: true
+                  description: Required for phone
+                user_type:
+                  type: string
+                  enum: [personal, store, driver]
+                  default: personal
+                preferred_language:
+                  type: string
+                  enum: [en, ar]
+                  default: en
+                name:
+                  type: string
+                  nullable: true
+                invite_code:
+                  type: string
+                  nullable: true
+                  maxLength: 16
+                license_image:
+                  type: string
+                  format: binary
+                  description: Company/store license image (jpg/png/webp). **Required when user_type=store.** Saved as Cloudflare R2 object key in users.license_image_path.
+            encoding:
+              license_image:
+                contentType: image/jpeg, image/png, image/webp
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RegisterRequest'
+            examples:
+              phone_personal:
+                summary: Personal (JSON — no license)
+                value:
+                  login_provider_name: phone
+                  phone: "971501234567"
+                  user_type: personal
+                  preferred_language: en
+                  name: Sara
+                  invite_code: INVITE01
+              google:
+                value:
+                  login_provider_name: google
+                  token: "test:google-user-1:sara@example.com:Sara"
+                  user_type: personal
+      responses:
+        '201':
+          description: Created + API token
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthResponse'
+        '409':
+          description: Phone/email conflict
+        '422':
+          description: Validation / license_required for store
+
+  /auth/login:
+    post:
+      tags: [Auth]
+      summary: Login — returns Sanctum token + full profile
+      operationId: authLogin
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LoginRequest'
+            examples:
+              phone:
+                value:
+                  login_provider_name: phone
+                  phone: "971501234567"
+              phone_driver_with_location:
+                value:
+                  login_provider_name: phone
+                  phone: "971508888001"
+                  latitude: 25.2048
+                  longitude: 55.2708
+              google:
+                value:
+                  login_provider_name: google
+                  token: "test:google-user-1:sara@example.com:Sara"
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthResponse'
+        '404':
+          description: Phone account not found
+        '422':
+          description: Validation
+
+  /auth/location:
+    patch:
+      tags: [Auth]
+      summary: Update GPS + H3 index (drivers should call on app open / while moving)
+      operationId: authUpdateLocation
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [latitude, longitude]
+              properties:
+                latitude: { type: number, minimum: -90, maximum: 90 }
+                longitude: { type: number, minimum: -180, maximum: 180 }
+            example:
+              latitude: 25.2048
+              longitude: 55.2708
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  location:
+                    $ref: '#/components/schemas/UserLocation'
+
+  /auth/me:
+    get:
+      tags: [Auth]
+      summary: Current user (loyalty + orders counts)
+      security:
+        - bearerAuth: []
+      operationId: authMe
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  user:
+                    $ref: '#/components/schemas/User'
+
+  /auth/logout:
+    post:
+      tags: [Auth]
+      summary: Revoke current token
+      security:
+        - bearerAuth: []
+      operationId: authLogout
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+
+  /auth/language:
+    patch:
+      tags: [Auth]
+      summary: Update preferred language (notifications)
+      security:
+        - bearerAuth: []
+      operationId: authUpdateLanguage
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [preferred_language]
+              properties:
+                preferred_language:
+                  type: string
+                  enum: [en, ar]
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  user:
+                    $ref: '#/components/schemas/User'
+
+  /auth/profile:
+    patch:
+      tags: [Auth, Profile]
+      summary: Edit profile (JSON)
+      description: |
+        Figma **Edit profile**: Full name, Email address, Mobile number, language, push toggle.
+        All fields optional — send only what changed. Email/phone must be unique (409 if taken).
+      security:
+        - bearerAuth: []
+      operationId: updateProfile
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateProfileRequest'
+            example:
+              name: Nethmi Perera
+              email: nethmi.perera@gmail.com
+              phone: "+971509998877"
+              preferred_language: ar
+              push_notifications_enabled: false
+      responses:
+        '200':
+          description: Updated profile
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  user:
+                    $ref: '#/components/schemas/User'
+        '409':
+          description: email_taken / phone_taken
+        '422':
+          description: Validation (e.g. phone_invalid)
+    post:
+      tags: [Auth, Profile]
+      summary: Edit profile + change photo (multipart)
+      description: |
+        Same fields as PATCH, plus **`profile_image`** file (Figma "Change photo" → Cloudflare R2 `profiles/`).
+        Use this POST variant from mobile/multipart clients. Saved as `users.profile_image_path`.
+      security:
+        - bearerAuth: []
+      operationId: updateProfileWithPhoto
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              properties:
+                name:
+                  type: string
+                  maxLength: 120
+                email:
+                  type: string
+                  format: email
+                phone:
+                  type: string
+                  maxLength: 32
+                preferred_language:
+                  type: string
+                  enum: [en, ar]
+                push_notifications_enabled:
+                  type: boolean
+                profile_image:
+                  type: string
+                  format: binary
+                  description: Profile photo (jpg/png/webp, max 5MB)
+            encoding:
+              profile_image:
+                contentType: image/jpeg, image/png, image/webp
+      responses:
+        '200':
+          description: Updated profile
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  user:
+                    $ref: '#/components/schemas/User'
+        '409':
+          description: email_taken / phone_taken
+        '422':
+          description: Validation
+
+  /addresses:
+    get:
+      tags: [Profile]
+      summary: List my saved addresses (Figma My profile)
+      security:
+        - bearerAuth: []
+      operationId: listAddresses
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  addresses:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/SavedAddress'
+    post:
+      tags: [Profile]
+      summary: Add saved address (Home / Work / Other)
+      security:
+        - bearerAuth: []
+      operationId: createAddress
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SavedAddressInput'
+            example:
+              label: home
+              address: "24 Flower Road, Colombo 07"
+              latitude: 6.9147
+              longitude: 79.8560
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  address:
+                    $ref: '#/components/schemas/SavedAddress'
+
+  /addresses/{address}:
+    patch:
+      tags: [Profile]
+      summary: Update saved address
+      security:
+        - bearerAuth: []
+      operationId: updateAddress
+      parameters:
+        - name: address
+          in: path
+          required: true
+          schema:
+            type: integer
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SavedAddressInput'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  address:
+                    $ref: '#/components/schemas/SavedAddress'
+        '404':
+          description: Not found
+    delete:
+      tags: [Profile]
+      summary: Delete saved address
+      security:
+        - bearerAuth: []
+      operationId: deleteAddress
+      parameters:
+        - name: address
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+
+  /orders:
+    get:
+      tags: [Orders]
+      summary: List my orders
+      security:
+        - bearerAuth: []
+      operationId: listOrders
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  orders:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Order'
+    post:
+      tags: [Orders]
+      summary: Create order + Stripe/cash payment
+      description: |
+        Returns `{ order, payment }`.
+        For card: use `payment.client_secret` with Stripe SDK, then poll payment-status.
+        For **personal shopping invoice**: use media type **multipart/form-data** and attach **`invoice_image`**.
+        When multipart, send `details` as a JSON string.
+      security:
+        - bearerAuth: []
+      operationId: createOrder
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [service, details]
+              properties:
+                service:
+                  type: string
+                  description: e.g. personal shopping / send a package / 1-4
+                  example: personal shopping
+                subtotal:
+                  type: number
+                  example: 50
+                tip_amount:
+                  type: number
+                payment_method:
+                  type: string
+                  enum: [card, cash]
+                  default: card
+                payer:
+                  type: string
+                  enum: [sender, receiver]
+                pickup_timing:
+                  type: string
+                  enum: [asap, scheduled]
+                promo_code:
+                  type: string
+                loyalty_points_to_redeem:
+                  type: integer
+                distance_km:
+                  type: number
+                details:
+                  type: string
+                  description: |
+                    JSON string array of order details. Example:
+                    [{"transportation":"car","delivery_speed":"standard","pickup_latitude":25.1,"pickup_longitude":55.2,"dropoff_latitude":25.3,"dropoff_longitude":55.4,"store_name":"Carrefour","shopping_request":"2x milk","is_already_paid":false,"expected_order_value":30,"sender_name":"Desk","sender_phone":"971506666666","receiver_name":"Omar","receiver_phone":"971507777777"}]
+                invoice_image:
+                  type: string
+                  format: binary
+                  description: Personal shopping invoice image (jpg/png/webp). Saved as Cloudflare R2 object key in order_details.invoice_image_path.
+            encoding:
+              invoice_image:
+                contentType: image/jpeg, image/png, image/webp
+              details:
+                contentType: application/json
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateOrderRequest'
+            examples:
+              send_package_card:
+                summary: Send package + card (Stripe)
+                value:
+                  service: send a package
+                  subtotal: 25.5
+                  tip_amount: 5
+                  payment_method: card
+                  payer: sender
+                  pickup_timing: asap
+                  distance_km: 4.2
+                  promo_code: SAVE10
+                  loyalty_points_to_redeem: 0
+                  details:
+                    - transportation: motorcycle
+                      delivery_preference: call_on_arrival
+                      delivery_speed: standard
+                      minutes: 45
+                      pickup_latitude: 25.2048
+                      pickup_longitude: 55.2708
+                      dropoff_latitude: 25.1972
+                      dropoff_longitude: 55.2744
+                      pickup_address: Marina Walk, Dubai
+                      dropoff_address: Downtown Dubai
+                      package_size: Small box
+                      pickup_notes: Call downstairs
+                      dropoff_notes: Leave with guard
+                      sender_name: Ali
+                      sender_phone: "971501111111"
+                      receiver_name: Sara
+                      receiver_phone: "971502222222"
+                      inside_the_package: Documents
+              cash_cod:
+                summary: Cash on delivery (receiver pays)
+                value:
+                  service: receive a package
+                  subtotal: 15
+                  payment_method: cash
+                  payer: receiver
+                  details:
+                    - transportation: car
+                      delivery_speed: standard
+                      pickup_latitude: 25.2
+                      pickup_longitude: 55.27
+                      dropoff_latitude: 25.21
+                      dropoff_longitude: 55.28
+                      sender_name: Ali
+                      sender_phone: "971501111111"
+                      receiver_name: Sara
+                      receiver_phone: "971502222222"
+                      inside_the_package: Documents
+              request_delivery:
+                summary: Multiple details
+                value:
+                  service: request delivery
+                  subtotal: 80
+                  payment_method: card
+                  details:
+                    - transportation: car
+                      delivery_speed: rush
+                      minutes: 20
+                      pickup_latitude: 25.20
+                      pickup_longitude: 55.27
+                      dropoff_latitude: 25.21
+                      dropoff_longitude: 55.28
+                      sender_name: Store A
+                      sender_phone: "971503333333"
+                      receiver_name: Client 1
+                      receiver_phone: "971504444444"
+                      inside_the_package: Box 1
+                    - transportation: motorcycle
+                      delivery_speed: standard
+                      pickup_latitude: 25.20
+                      pickup_longitude: 55.27
+                      dropoff_latitude: 25.22
+                      dropoff_longitude: 55.29
+                      sender_name: Store A
+                      sender_phone: "971503333333"
+                      receiver_name: Client 2
+                      receiver_phone: "971505555555"
+                      inside_the_package: Box 2
+              personal_shopping_json:
+                summary: Personal shopping (JSON without file)
+                value:
+                  service: personal shopping
+                  subtotal: 50
+                  payment_method: card
+                  details:
+                    - transportation: car
+                      delivery_speed: standard
+                      pickup_latitude: 25.1
+                      pickup_longitude: 55.2
+                      dropoff_latitude: 25.3
+                      dropoff_longitude: 55.4
+                      store_name: Carrefour
+                      shopping_request: 2x milk, 1x bread
+                      is_already_paid: false
+                      expected_order_value: 30
+                      sender_name: Carrefour Desk
+                      sender_phone: "971506666666"
+                      receiver_name: Omar
+                      receiver_phone: "971507777777"
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CreateOrderResponse'
+        '401':
+          description: Unauthenticated
+        '422':
+          description: Validation error
+
+  /orders/{order}:
+    get:
+      tags: [Orders]
+      summary: Get own order (timeline + payment)
+      security:
+        - bearerAuth: []
+      operationId: getOrder
+      parameters:
+        - $ref: '#/components/parameters/OrderId'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OrderEnvelope'
+        '404':
+          description: Not found
+
+  /orders/{order}/payment-status:
+    get:
+      tags: [Payments]
+      summary: Poll until Stripe webhook confirms payment
+      description: |
+        Flutter should poll this after confirming PaymentIntent.
+        `success` / `paid` become true only after Stripe webhook; order then moves to `awaiting_driver`.
+      security:
+        - bearerAuth: []
+      operationId: orderPaymentStatus
+      parameters:
+        - $ref: '#/components/parameters/OrderId'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PaymentStatusResponse'
+
+  /orders/{order}/cancel:
+    post:
+      tags: [Orders]
+      summary: Cancel order (reason required, auto-refund if paid)
+      description: |
+        **`cancellation_reason` is required.**
+        Allowed only before a driver accepts: statuses `pending_payment`, `awaiting_cash`, `confirmed`, `awaiting_driver` (`order.can_cancel=true`).
+        In `driver_assigned` (driver accepted), `picked_up` (in delivery) or `delivered` → 422 `cannot_cancel`.
+        If the card payment was already paid, a **Stripe refund is issued automatically to the original payment method**
+        and the response includes `refund_status` + refunded `payment`. Unpaid intents are voided. Loyalty points restored, promo released.
+      security:
+        - bearerAuth: []
+      operationId: cancelOrder
+      parameters:
+        - $ref: '#/components/parameters/OrderId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [cancellation_reason]
+              properties:
+                cancellation_reason:
+                  type: string
+                  maxLength: 500
+                  description: Why the customer is cancelling (stored on the order)
+                  example: Changed my mind
+            example:
+              cancellation_reason: Changed my mind
+      responses:
+        '200':
+          description: Cancelled (check refund_status)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CancelOrderResponse'
+              examples:
+                refunded:
+                  summary: Paid card order — refunded
+                  value:
+                    order:
+                      id: RSH-A3K9MX
+                      status: cancelled
+                      cancellation_reason: Changed my mind
+                      cancelled_at: "2026-11-23T13:20:00Z"
+                      refund_status: refunded
+                      can_cancel: false
+                    refund_status: refunded
+                    payment:
+                      method: card
+                      status: refunded
+                      refund_id: re_fake_abc123
+                      refunded_amount: "30.00"
+                not_required:
+                  summary: Unpaid/cash — no refund needed
+                  value:
+                    refund_status: not_required
+                    payment:
+                      method: cash
+                      status: cancelled
+        '422':
+          description: |
+            `cancellation_reason_required` (missing reason) or `cannot_cancel` (driver already accepted / picked up / delivered).
+            Error body includes `meta.current_status`.
+          content:
+            application/json:
+              example:
+                message: Order cannot be cancelled in its current status. Cancellation is only allowed before a driver accepts the order.
+                code: cannot_cancel
+                meta:
+                  current_status: picked_up
+
+  /orders/{order}/rate:
+    post:
+      tags: [Orders]
+      summary: Rate delivered order
+      security:
+        - bearerAuth: []
+      operationId: rateOrder
+      parameters:
+        - $ref: '#/components/parameters/OrderId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [rating]
+              properties:
+                rating:
+                  type: integer
+                  minimum: 1
+                  maximum: 5
+                comment:
+                  type: string
+                  nullable: true
+                  maxLength: 500
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OrderEnvelope'
+        '422':
+          description: Not delivered
+
+  /webhooks/stripe:
+    post:
+      tags: [Payments]
+      summary: Stripe webhook (payment_intent.succeeded)
+      description: |
+        Called by Stripe. Verifies `Stripe-Signature` unless `STRIPE_FAKE=true`.
+        On success → marks payment paid + order `awaiting_driver` (waiting for driver acceptance) + pushes notification.
+      operationId: stripeWebhook
+      parameters:
+        - name: Stripe-Signature
+          in: header
+          required: false
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              description: Stripe event payload
+            example:
+              type: payment_intent.succeeded
+              data:
+                object:
+                  id: pi_fake_abc123
+      responses:
+        '200':
+          description: Received
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  received:
+                    type: boolean
+        '400':
+          description: Invalid signature/payload
+
+  /notifications:
+    get:
+      tags: [Notifications]
+      summary: List notifications (localized + deep link route)
+      security:
+        - bearerAuth: []
+      operationId: listNotifications
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/NotificationListResponse'
+
+  /notifications/read-all:
+    post:
+      tags: [Notifications]
+      summary: Mark all notifications as read for current user
+      security:
+        - bearerAuth: []
+      operationId: markAllNotificationsRead
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  updated:
+                    type: integer
+
+  /notifications/{notification}/read:
+    post:
+      tags: [Notifications]
+      summary: Mark one notification as read
+      security:
+        - bearerAuth: []
+      operationId: markNotificationRead
+      parameters:
+        - name: notification
+          in: path
+          required: true
+          schema:
+            type: string
+            description: Notification public_id (ULID)
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  notification:
+                    $ref: '#/components/schemas/Notification'
+
+  /loyalty:
+    get:
+      tags: [Loyalty]
+      summary: Public loyalty settings (for mobile copy)
+      operationId: loyaltyInfo
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  loyalty:
+                    $ref: '#/components/schemas/LoyaltySettings'
+
+  /admin/loyalty:
+    put:
+      tags: [Admin, Loyalty]
+      summary: Update loyalty settings (admin)
+      security:
+        - bearerAuth: []
+      operationId: adminUpdateLoyalty
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                aed_per_point:
+                  type: number
+                  example: 0.1
+                invite_reward_points:
+                  type: integer
+                  example: 50
+                min_completed_orders_for_invite:
+                  type: integer
+                  example: 1
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  loyalty:
+                    $ref: '#/components/schemas/LoyaltySettings'
+        '403':
+          description: Admin required
+
+  /admin/promo-codes:
+    get:
+      tags: [Admin]
+      summary: List promo codes
+      security:
+        - bearerAuth: []
+      operationId: adminListPromoCodes
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  promo_codes:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/PromoCode'
+        '403':
+          description: Admin required
+    post:
+      tags: [Admin]
+      summary: Create promo code
+      security:
+        - bearerAuth: []
+      operationId: adminCreatePromoCode
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreatePromoCodeRequest'
+            examples:
+              fixed:
+                value:
+                  code: SAVE10
+                  type: fixed
+                  value: 10
+                  max_redemptions: 100
+              percent:
+                value:
+                  code: OFF20
+                  type: percent
+                  value: 20
+                  max_redemptions: 50
+                  expires_at: "2027-01-01T00:00:00Z"
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  promo_code:
+                    $ref: '#/components/schemas/PromoCode'
+        '403':
+          description: Admin required
+        '409':
+          description: Code already exists
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: Sanctum
+      description: Paste the `token` from register/login as Bearer token
+
+  parameters:
+    OrderId:
+      name: order
+      in: path
+      required: true
+      schema:
+        type: string
+        example: RSH-A3K9MX
+
+  schemas:
+    RegisterRequest:
+      type: object
+      required: [login_provider_name]
+      properties:
+        login_provider_name:
+          type: string
+          enum: [google, apple, phone]
+        token:
+          type: string
+          nullable: true
+        phone:
+          type: string
+          nullable: true
+        user_type:
+          type: string
+          enum: [personal, store, driver]
+          default: personal
+        preferred_language:
+          type: string
+          enum: [en, ar]
+          default: en
+        name:
+          type: string
+          nullable: true
+        invite_code:
+          type: string
+          nullable: true
+          maxLength: 16
+          description: Inviter invite_code for loyalty
+        latitude:
+          type: number
+          nullable: true
+          description: Optional GPS (recommended for drivers)
+        longitude:
+          type: number
+          nullable: true
+
+    LoginRequest:
+      type: object
+      required: [login_provider_name]
+      properties:
+        login_provider_name:
+          type: string
+          enum: [google, apple, phone]
+        token:
+          type: string
+          nullable: true
+        phone:
+          type: string
+          nullable: true
+        latitude:
+          type: number
+          nullable: true
+          description: Driver GPS on app open — stored on users + H3 index
+        longitude:
+          type: number
+          nullable: true
+
+    UserLocation:
+      type: object
+      properties:
+        latitude:
+          type: string
+          nullable: true
+        longitude:
+          type: string
+          nullable: true
+        h3_index:
+          type: string
+          nullable: true
+          description: Hex cell at configured resolution (default 8)
+        location_updated_at:
+          type: string
+          format: date-time
+          nullable: true
+
+    AuthResponse:
+      type: object
+      required: [token, user]
+      properties:
+        token:
+          type: string
+        user:
+          $ref: '#/components/schemas/User'
+
+    User:
+      type: object
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+          nullable: true
+        email:
+          type: string
+          nullable: true
+        phone:
+          type: string
+          nullable: true
+        user_role_id:
+          type: integer
+          description: 1=personal, 2=store, 3=driver, 4=admin
+        user_type:
+          type: string
+          enum: [personal, store, driver, admin]
+        preferred_language:
+          type: string
+          enum: [en, ar]
+        os_provider_id:
+          type: integer
+        auth_provider:
+          type: string
+          enum: [google, apple, phone]
+        google_linked:
+          type: boolean
+        apple_linked:
+          type: boolean
+        invite_code:
+          type: string
+          nullable: true
+        loyalty_points:
+          type: integer
+        loyalty:
+          allOf:
+            - $ref: '#/components/schemas/LoyaltySettings'
+            - type: object
+              properties:
+                balance:
+                  type: integer
+                balance_aed_value:
+                  type: string
+        orders_count:
+          type: integer
+        completed_orders_count:
+          type: integer
+        license_image_path:
+          type: string
+          nullable: true
+        license_image_url:
+          type: string
+          nullable: true
+        profile_image_path:
+          type: string
+          nullable: true
+          description: Cloudflare R2 object key of profile photo
+        profile_image_url:
+          type: string
+          nullable: true
+        push_notifications_enabled:
+          type: boolean
+          default: true
+        location:
+          $ref: '#/components/schemas/UserLocation'
+        driver:
+          allOf:
+            - $ref: '#/components/schemas/DriverProfile'
+          nullable: true
+          description: Present only when user_type=driver
+        created_at:
+          type: string
+          format: date-time
+        last_login_at:
+          type: string
+          format: date-time
+          nullable: true
+
+    DriverProfile:
+      type: object
+      properties:
+        verification_status:
+          type: string
+          enum: [incomplete, under_review, approved, rejected]
+        can_go_online:
+          type: boolean
+        verification_note:
+          type: string
+          nullable: true
+        submitted_at:
+          type: string
+          format: date-time
+          nullable: true
+        verified_at:
+          type: string
+          format: date-time
+          nullable: true
+        national_id_number:
+          type: string
+          nullable: true
+        national_id_front_url:
+          type: string
+          nullable: true
+        national_id_back_url:
+          type: string
+          nullable: true
+        personal_photo_url:
+          type: string
+          nullable: true
+        driving_license_front_url:
+          type: string
+          nullable: true
+        emergency_contact_name:
+          type: string
+          nullable: true
+        emergency_contact_phone:
+          type: string
+          nullable: true
+        bank_name:
+          type: string
+          nullable: true
+        iban:
+          type: string
+          nullable: true
+        ziina_payment_link:
+          type: string
+          nullable: true
+        service_area:
+          type: string
+          nullable: true
+        missing_requirements:
+          type: array
+          items: { type: string }
+        vehicle:
+          nullable: true
+          type: object
+          properties:
+            id: { type: integer }
+            transportation_id:
+              type: integer
+              description: FK service_transportations.id
+            transportation:
+              type: string
+              enum: [car, motorcycle]
+            model: { type: string }
+            color: { type: string, nullable: true }
+            plate_number: { type: string }
+            vehicle_image_url: { type: string, nullable: true }
+            document_url: { type: string, nullable: true }
+
+    UpdateProfileRequest:
+      type: object
+      description: Edit Profile (Figma) — all fields optional
+      properties:
+        name:
+          type: string
+          maxLength: 120
+          example: Nethmi Perera
+        email:
+          type: string
+          format: email
+          example: nethmi.perera@gmail.com
+        phone:
+          type: string
+          maxLength: 32
+          description: Digits stored without +/spaces; must be unique
+          example: "+971509998877"
+        preferred_language:
+          type: string
+          enum: [en, ar]
+        push_notifications_enabled:
+          type: boolean
+
+    SavedAddressInput:
+      type: object
+      required: [label, address, latitude, longitude]
+      properties:
+        label:
+          type: string
+          enum: [home, work, other]
+        address:
+          type: string
+          maxLength: 255
+        latitude:
+          type: number
+        longitude:
+          type: number
+        notes:
+          type: string
+          nullable: true
+          maxLength: 200
+
+    SavedAddress:
+      type: object
+      properties:
+        id:
+          type: integer
+        label:
+          type: string
+          enum: [home, work, other]
+        address:
+          type: string
+        latitude:
+          type: string
+        longitude:
+          type: string
+        notes:
+          type: string
+          nullable: true
+        created_at:
+          type: string
+          format: date-time
+
+    LoyaltySettings:
+      type: object
+      properties:
+        aed_per_point:
+          type: number
+          example: 0.1
+        invite_reward_points:
+          type: integer
+          example: 50
+        min_completed_orders_for_invite:
+          type: integer
+          example: 1
+
+    CreateOrderRequest:
+      type: object
+      required: [service, details]
+      properties:
+        service:
+          description: Service id (1–4) or name
+          oneOf:
+            - type: integer
+              enum: [1, 2, 3, 4]
+            - type: string
+              enum:
+                - send a package
+                - receive a package
+                - personal shopping
+                - request delivery
+        subtotal:
+          type: number
+          minimum: 0
+          description: Delivery fee before discounts/tip
+        total:
+          type: number
+          nullable: true
+          minimum: 0
+          description: Legacy alias; prefer subtotal
+        tip_amount:
+          type: number
+          minimum: 0
+          default: 0
+        distance_km:
+          type: number
+          nullable: true
+        payment_method:
+          type: string
+          enum: [card, cash]
+          default: card
+        payer:
+          type: string
+          enum: [sender, receiver]
+          default: sender
+        pickup_timing:
+          type: string
+          enum: [asap, scheduled]
+          default: asap
+        scheduled_pickup_at:
+          type: string
+          format: date-time
+          nullable: true
+        promo_code:
+          type: string
+          nullable: true
+        loyalty_points_to_redeem:
+          type: integer
+          minimum: 0
+          default: 0
+        estimated_pickup_minutes:
+          type: integer
+          nullable: true
+        estimated_delivery_minutes:
+          type: integer
+          nullable: true
+        details:
+          type: array
+          minItems: 1
+          items:
+            $ref: '#/components/schemas/OrderDetailInput'
+
+    OrderDetailInput:
+      type: object
+      required:
+        - pickup_latitude
+        - pickup_longitude
+        - dropoff_latitude
+        - dropoff_longitude
+        - sender_name
+        - sender_phone
+        - receiver_name
+        - receiver_phone
+      properties:
+        transportation:
+          type: string
+          enum: [car, motorcycle]
+        transportation_id:
+          type: integer
+          enum: [1, 2]
+        delivery_preference:
+          type: string
+          nullable: true
+          enum:
+            - call_on_arrival
+            - dont_knock_on_the_door
+            - leave
+            - leave_at_reception
+            - ring_the_bell
+        delivery_preference_id:
+          type: integer
+          nullable: true
+          enum: [1, 2, 3, 4, 5]
+        delivery_speed:
+          type: string
+          enum: [standard, rush]
+        delivery_speed_id:
+          type: integer
+          enum: [1, 2]
+        minutes:
+          type: integer
+          nullable: true
+        pickup_latitude:
+          type: number
+        pickup_longitude:
+          type: number
+        dropoff_latitude:
+          type: number
+        dropoff_longitude:
+          type: number
+        pickup_address:
+          type: string
+          nullable: true
+          maxLength: 255
+        dropoff_address:
+          type: string
+          nullable: true
+          maxLength: 255
+        package_size:
+          type: string
+          nullable: true
+          example: Small box
+        pickup_notes:
+          type: string
+          nullable: true
+          maxLength: 200
+        dropoff_notes:
+          type: string
+          nullable: true
+          maxLength: 200
+        store_name:
+          type: string
+          nullable: true
+          description: Required for personal shopping
+        shopping_request:
+          type: string
+          nullable: true
+          description: Required for personal shopping
+        is_already_paid:
+          type: boolean
+          nullable: true
+        expected_order_value:
+          type: number
+          nullable: true
+          description: Required for personal shopping
+        sender_name:
+          type: string
+          maxLength: 120
+        sender_phone:
+          type: string
+          maxLength: 32
+        receiver_name:
+          type: string
+          maxLength: 120
+        receiver_phone:
+          type: string
+          maxLength: 32
+        inside_the_package:
+          type: string
+          nullable: true
+          maxLength: 500
+          description: Required except personal shopping
+
+    CreateOrderResponse:
+      type: object
+      properties:
+        order:
+          $ref: '#/components/schemas/Order'
+        payment:
+          $ref: '#/components/schemas/Payment'
+
+    OrderEnvelope:
+      type: object
+      properties:
+        order:
+          $ref: '#/components/schemas/Order'
+
+    CancelOrderResponse:
+      type: object
+      properties:
+        order:
+          $ref: '#/components/schemas/Order'
+        refund_status:
+          type: string
+          enum: [refunded, not_required, manual]
+          description: refunded = money returned via Stripe to original payment method
+        payment:
+          $ref: '#/components/schemas/Payment'
+
+    Order:
+      type: object
+      properties:
+        id:
+          type: string
+          example: RSH-A3K9MX
+        service_id:
+          type: integer
+        service_name:
+          type: string
+        status_id:
+          type: integer
+        status:
+          type: string
+          description: FK order_statuses.code — awaiting_driver = waiting for driver acceptance
+          enum:
+            - pending_payment
+            - awaiting_driver
+            - confirmed
+            - driver_assigned
+            - picked_up
+            - delivered
+            - cancelled
+            - awaiting_cash
+        payment_method:
+          type: string
+          enum: [card, cash]
+        payer:
+          type: string
+          enum: [sender, receiver]
+        pickup_timing:
+          type: string
+          enum: [asap, scheduled]
+        scheduled_pickup_at:
+          type: string
+          format: date-time
+          nullable: true
+        distance_km:
+          type: string
+          nullable: true
+        subtotal:
+          type: string
+        discount_amount:
+          type: string
+        tip_amount:
+          type: string
+        loyalty_discount_amount:
+          type: string
+        loyalty_points_redeemed:
+          type: integer
+        promo_code:
+          type: string
+          nullable: true
+        total:
+          type: string
+        estimated_pickup_minutes:
+          type: integer
+          nullable: true
+        estimated_delivery_minutes:
+          type: integer
+          nullable: true
+        rating:
+          type: integer
+          nullable: true
+        rating_comment:
+          type: string
+          nullable: true
+        can_cancel:
+          type: boolean
+          description: True only before a driver accepts (pending_payment/awaiting_cash/confirmed/awaiting_driver)
+        cancellation_reason:
+          type: string
+          nullable: true
+        cancelled_at:
+          type: string
+          format: date-time
+          nullable: true
+        refund_status:
+          type: string
+          nullable: true
+          enum: [refunded, not_required, manual]
+          description: Set on cancellation — refunded = Stripe refund to original payment method
+        driver_id:
+          type: string
+          nullable: true
+        ordered_at:
+          type: string
+          format: date-time
+        created_at:
+          type: string
+          format: date-time
+        timeline:
+          type: array
+          items:
+            type: object
+            properties:
+              status:
+                type: string
+              note:
+                type: string
+                nullable: true
+              occurred_at:
+                type: string
+                format: date-time
+        payment:
+          $ref: '#/components/schemas/Payment'
+        details:
+          type: array
+          items:
+            $ref: '#/components/schemas/OrderDetail'
+
+    OrderDetail:
+      type: object
+      properties:
+        id:
+          type: string
+        transportation_id:
+          type: integer
+        transportation:
+          type: string
+          enum: [car, motorcycle]
+        delivery_preference_id:
+          type: integer
+          nullable: true
+        delivery_preference:
+          type: string
+          nullable: true
+        delivery_speed_id:
+          type: integer
+        delivery_speed:
+          type: string
+          enum: [standard, rush]
+        minutes:
+          type: integer
+          nullable: true
+        pickup_latitude:
+          type: string
+        pickup_longitude:
+          type: string
+        dropoff_latitude:
+          type: string
+        dropoff_longitude:
+          type: string
+        pickup_address:
+          type: string
+          nullable: true
+        dropoff_address:
+          type: string
+          nullable: true
+        package_size:
+          type: string
+          nullable: true
+        pickup_notes:
+          type: string
+          nullable: true
+        dropoff_notes:
+          type: string
+          nullable: true
+        store_name:
+          type: string
+          nullable: true
+        shopping_request:
+          type: string
+          nullable: true
+        is_already_paid:
+          type: boolean
+          nullable: true
+        expected_order_value:
+          type: string
+          nullable: true
+        invoice_image_path:
+          type: string
+          nullable: true
+        invoice_image_url:
+          type: string
+          nullable: true
+        sender_name:
+          type: string
+        sender_phone:
+          type: string
+        receiver_name:
+          type: string
+        receiver_phone:
+          type: string
+        inside_the_package:
+          type: string
+          nullable: true
+
+    Payment:
+      type: object
+      properties:
+        id:
+          type: string
+        order_id:
+          type: string
+        method:
+          type: string
+          enum: [card, cash]
+        status:
+          type: string
+          enum: [pending, requires_action, paid, failed, cancelled, refunded]
+        amount:
+          type: string
+        currency:
+          type: string
+          example: aed
+        client_secret:
+          type: string
+          nullable: true
+          description: Stripe PaymentIntent client_secret (card only)
+        transaction_id:
+          type: string
+          nullable: true
+        refund_id:
+          type: string
+          nullable: true
+          description: Stripe refund id (re_...) after cancellation of a paid order
+        refunded_amount:
+          type: string
+          nullable: true
+        refunded_at:
+          type: string
+          format: date-time
+          nullable: true
+        paid_at:
+          type: string
+          format: date-time
+          nullable: true
+        created_at:
+          type: string
+          format: date-time
+
+    PaymentStatusResponse:
+      type: object
+      properties:
+        order_id:
+          type: string
+        order_status:
+          type: string
+        paid:
+          type: boolean
+        success:
+          type: boolean
+          description: Same as paid — true only after Stripe webhook (or cash path)
+        payment:
+          $ref: '#/components/schemas/Payment'
+
+    Notification:
+      type: object
+      properties:
+        id:
+          type: string
+        title:
+          type: string
+          description: Localized by preferred_language
+        body:
+          type: string
+        title_en:
+          type: string
+        title_ar:
+          type: string
+        body_en:
+          type: string
+        body_ar:
+          type: string
+        route:
+          type: string
+          nullable: true
+          example: /orders/RSH-A3K9MX
+        data:
+          type: object
+          nullable: true
+        is_read:
+          type: boolean
+        read_at:
+          type: string
+          format: date-time
+          nullable: true
+        created_at:
+          type: string
+          format: date-time
+
+    NotificationListResponse:
+      type: object
+      properties:
+        notifications:
+          type: array
+          items:
+            $ref: '#/components/schemas/Notification'
+        unread_count:
+          type: integer
+
+    CreatePromoCodeRequest:
+      type: object
+      required: [code, type, value]
+      properties:
+        code:
+          type: string
+          maxLength: 40
+        type:
+          type: string
+          enum: [fixed, percent]
+        value:
+          type: number
+          minimum: 0
+          description: AED amount (fixed) or percent (0–100)
+        max_redemptions:
+          type: integer
+          nullable: true
+          minimum: 1
+          description: Max people/uses; null = unlimited
+        is_active:
+          type: boolean
+          default: true
+        starts_at:
+          type: string
+          format: date-time
+          nullable: true
+        expires_at:
+          type: string
+          format: date-time
+          nullable: true
+
+    PromoCode:
+      type: object
+      properties:
+        id:
+          type: integer
+        code:
+          type: string
+        type:
+          type: string
+          enum: [fixed, percent]
+        value:
+          type: string
+        max_redemptions:
+          type: integer
+          nullable: true
+        times_redeemed:
+          type: integer
+        is_active:
+          type: boolean
+        starts_at:
+          type: string
+          format: date-time
+          nullable: true
+        expires_at:
+          type: string
+          format: date-time
+          nullable: true
+        created_at:
+          type: string
+          format: date-time
